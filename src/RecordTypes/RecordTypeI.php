@@ -10,6 +10,7 @@ use Ycdev\PhpIgcInspector\Exception\InvalidIgcException;
 class RecordTypeI extends AbstractRecordType
 {
     protected array $format = [0 => ["Record", 0, 0, "", ""]];
+    protected bool $ignoreRecord = true;
 
     public function matches(string $line): bool
     {

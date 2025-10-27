@@ -19,7 +19,6 @@ class PhpIgcInspector
     private string $content;
     private ?object $flight = null;
     private bool $withRaw = true;
-
     /**
      * Constructeur
      * 
@@ -99,6 +98,12 @@ class PhpIgcInspector
             // Instancier la classe RecordType
             /** @var AbstractRecordType $record */
             $record = new $className($line, $lineNum + 1, $previousRecordType, $this->withRaw, $flight);
+            
+            // Si cet enregistrement doit être ignoré, passer à la ligne suivante
+            if ($record->isIgnoreRecord()) {
+                $previousRecordType = $firstChar;
+                continue;
+            }
             
             // Vérifier si ce type d'enregistrement est unique
             if ($record->isSingleRecord()) {
@@ -210,6 +215,31 @@ class PhpIgcInspector
         }
         
         return $metadata;
+    }
+    
+    /**
+     * Convertit l'objet flight en JSON
+     * 
+     * @param int $flags Options pour json_encode (par défaut JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE)
+     * @return string|null Représentation JSON de l'objet flight
+     */
+    public function stringify(int $flags = JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE): ?string
+    {
+        if ($this->flight === null) {
+            return null;
+        }
+        
+        return json_encode($this->flight, $flags);
+    }
+    
+    /**
+     * Retourne l'objet flight au format JSON
+     * 
+     * @return string|null Représentation JSON de l'objet flight
+     */
+    public function toJson(): ?string
+    {
+        return $this->stringify();
     }
 }
 

@@ -43,6 +43,11 @@ abstract class AbstractRecordType implements RecordTypeInterface
     protected bool $withRaw = true;
     
     /**
+     * Si true, cet enregistrement sera ignoré lors du parsing (ne sera pas ajouté à l'objet flight)
+     */
+    protected bool $ignoreRecord = false;
+    
+    /**
      * Identifiant du type d'enregistrement (ex: 'Manufacturer', 'Fix', etc.)
      */
     protected string $recordId = 'Record';
@@ -136,6 +141,14 @@ abstract class AbstractRecordType implements RecordTypeInterface
     public function isSingleObject(): bool
     {
         return $this->singleObject;
+    }
+    
+    /**
+     * Retourne si cet enregistrement doit être ignoré
+     */
+    public function isIgnoreRecord(): bool
+    {
+        return $this->ignoreRecord;
     }
     
     /**
