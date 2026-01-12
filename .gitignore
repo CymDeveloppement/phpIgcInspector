@@ -11,3 +11,6 @@
 Thumbs.db
 test.php
 flight.json
+
+# Dev files
+/dev/

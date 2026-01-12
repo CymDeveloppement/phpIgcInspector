@@ -5,6 +5,7 @@ namespace Ycdev\PhpIgcInspector;
 use Ycdev\PhpIgcInspector\Exception\InvalidIgcException;
 use Ycdev\PhpIgcInspector\RecordTypes\RecordTypeInterface;
 use Ycdev\PhpIgcInspector\RecordTypes\AbstractRecordType;
+use Ycdev\PhpIgcInspector\PhpIgcUtils;
 
 /**
  * Classe pour lire et manipuler les fichiers IGC
@@ -138,6 +139,9 @@ class PhpIgcInspector
             // Traitement spécial pour RecordTypeC (Task)
             if ($firstChar === 'C') {
                 $this->processTaskRecord($flight, $parsedData);
+            } elseif ($firstChar === 'E') {
+                // Traitement spécial pour RecordTypeE (Event)
+                $this->processEventRecord($flight, $parsedData);
             } elseif ($record->isSingleRecord()) {
                 // Si le record est unique, stocker directement
                 $flight->$recordId = $parsedData;
@@ -186,6 +190,9 @@ class PhpIgcInspector
         
         // Finaliser la structure de la tâche si elle existe
         $this->finalizeTask();
+        
+        // Finaliser la structure des événements si elle existe
+        $this->finalizeEvents();
         
         // Calculer les valeurs dérivées après le parsing complet
         $this->calculateDerivedValues();
@@ -268,7 +275,7 @@ class PhpIgcInspector
             }
             
             // Calculer la distance entre le point GPS et le waypoint
-            $distance = $this->calculateProximity(
+            $distance = PhpIgcUtils::calculateProximity(
                 $fix->latitude,
                 $fix->longitude,
                 $waypoint->latitude,
@@ -317,49 +324,123 @@ class PhpIgcInspector
         return $validation->allValidated;
     }
     
+    
     /**
-     * Calcule la distance entre deux points GPS (proximité)
+     * Traite un enregistrement de type E (Event)
      * 
-     * @param float $latitude1 Latitude du premier point (degrés décimaux)
-     * @param float $longitude1 Longitude du premier point (degrés décimaux)
-     * @param float $latitude2 Latitude du deuxième point (degrés décimaux)
-     * @param float $longitude2 Longitude du deuxième point (degrés décimaux)
-     * @return float Distance en mètres
+     * @param object $flight Objet flight
+     * @param object|null $parsedData Données parsées
      */
-    public function calculateProximity(float $latitude1, float $longitude1, float $latitude2, float $longitude2): float
+    private function processEventRecord(object $flight, ?object $parsedData): void
     {
-        // Points identiques
-        if ($latitude1 == $latitude2 && $longitude1 == $longitude2) {
-            return 0.0;
+        if ($parsedData === null) {
+            return;
         }
         
-        // Rayon de la Terre en mètres (WGS84)
-        $earthRadius = 6378137.0;
-        
-        // Conversion en radians
-        $lat1 = deg2rad($latitude1);
-        $lon1 = deg2rad($longitude1);
-        $lat2 = deg2rad($latitude2);
-        $lon2 = deg2rad($longitude2);
-        
-        // Différences
-        $dLat = $lat2 - $lat1;
-        $dLon = $lon2 - $lon1;
-        
-        // Formule de Haversine
-        $a = sin($dLat / 2) * sin($dLat / 2) +
-             cos($lat1) * cos($lat2) *
-             sin($dLon / 2) * sin($dLon / 2);
-        
-        $c = 2 * atan2(sqrt($a), sqrt(1 - $a));
-        $distance = $earthRadius * $c;
-        
-        // Protection contre NaN et valeurs infinies
-        if (is_nan($distance) || is_infinite($distance)) {
-            return PHP_FLOAT_MAX;
+        // Initialiser l'objet Events s'il n'existe pas
+        if (!isset($flight->Events)) {
+            $flight->Events = (object) [
+                'events' => [],
+                'eventsByType' => (object) []
+            ];
         }
         
-        return $distance;
+        // Ajouter l'événement à la liste
+        $flight->Events->events[] = $parsedData;
+        
+        // Grouper par type d'événement
+        $eventType = $parsedData->eventType ?? 'other';
+        if (!isset($flight->Events->eventsByType->$eventType)) {
+            $flight->Events->eventsByType->$eventType = [];
+        }
+        $flight->Events->eventsByType->$eventType[] = $parsedData;
+    }
+    
+    /**
+     * Finalise la structure des événements après le parsing complet
+     */
+    private function finalizeEvents(): void
+    {
+        if ($this->flight === null || !isset($this->flight->Events)) {
+            return;
+        }
+        
+        $events = $this->flight->Events;
+        
+        if (!isset($events->events) || empty($events->events)) {
+            return;
+        }
+        
+        // Récupérer la date du vol pour calculer les timestamps
+        $flightDate = null;
+        if (isset($this->flight->OtherInformation->date)) {
+            $flightDate = $this->flight->OtherInformation->date;
+        } elseif (isset($this->flight->Fix) && !empty($this->flight->Fix)) {
+            // Utiliser la date du premier point GPS
+            $firstFix = $this->flight->Fix[0];
+            if (isset($firstFix->date)) {
+                $flightDate = $firstFix->date;
+            }
+        }
+        
+        // Calculer les timestamps pour chaque événement
+        foreach ($events->events as $event) {
+            if (isset($event->timeFormatted) && $flightDate !== null) {
+                try {
+                    $event->timestamp = strtotime($flightDate . ' ' . $event->timeFormatted);
+                    if ($event->timestamp !== false) {
+                        $event->dateTime = date('Y-m-d H:i:s', $event->timestamp);
+                    }
+                } catch (\Exception $e) {
+                    // Ignorer les erreurs de conversion
+                }
+            }
+        }
+        
+        // Trier les événements par timestamp (ordre chronologique)
+        usort($events->events, function($a, $b) {
+            $tsA = $a->timestamp ?? 0;
+            $tsB = $b->timestamp ?? 0;
+            return $tsA <=> $tsB;
+        });
+        
+        // Identifier les événements importants
+        foreach ($events->events as $event) {
+            $eventType = $event->eventType ?? 'other';
+            
+            switch ($eventType) {
+                case 'start':
+                    if (!isset($events->start)) {
+                        $events->start = $event;
+                    }
+                    break;
+                case 'finish':
+                    $events->finish = $event; // Le dernier finish sera conservé
+                    break;
+                case 'takeoff':
+                    if (!isset($events->takeoff)) {
+                        $events->takeoff = $event;
+                    }
+                    break;
+                case 'landing':
+                    $events->landing = $event; // Le dernier landing sera conservé
+                    break;
+            }
+        }
+        
+        // Statistiques
+        $events->eventCount = count($events->events);
+        $events->eventTypes = array_keys((array) $events->eventsByType);
+        
+        // Compter les événements par type
+        $eventsByTypeArray = [];
+        foreach ($events->eventsByType as $type => $typeEvents) {
+            $eventsByTypeArray[$type] = [
+                'count' => count($typeEvents),
+                'events' => $typeEvents
+            ];
+        }
+        $events->eventsByType = (object) $eventsByTypeArray;
     }
     
     /**
@@ -550,7 +631,7 @@ class PhpIgcInspector
             
             // Conversion du temps total en format hh:mm:ss
             if (isset($info->totalTime) && $info->totalTime > 0) {
-                $info->totalTimeFormatted = $this->secondsToTime($info->totalTime);
+                $info->totalTimeFormatted = PhpIgcUtils::secondsToTime($info->totalTime);
                 $info->totalTimeHours = round($info->totalTime / 3600, 2);
             }
             
@@ -661,8 +742,8 @@ class PhpIgcInspector
                 if (!isset($this->flight->OtherInformation)) {
                     $this->flight->OtherInformation = (object) [];
                 }
-                $this->flight->OtherInformation->flightDuration = $flightDuration;
-                $this->flight->OtherInformation->flightDurationFormatted = $this->secondsToTime($flightDuration);
+                    $this->flight->OtherInformation->flightDuration = $flightDuration;
+                    $this->flight->OtherInformation->flightDurationFormatted = PhpIgcUtils::secondsToTime($flightDuration);
                 
                 // Date/heure de début et fin
                 if (isset($firstFix->dateTime)) {

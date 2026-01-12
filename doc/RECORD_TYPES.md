@@ -11,15 +11,19 @@ Déclaration de la tâche de vol.
 
 ## D - Differential GPS
 Données GPS différentielles pour améliorer la précision.
+📄 Voir [RECORDTYPE_D.md](RECORDTYPE_D.md) pour plus de détails.
 
 ## E - Event
 Événements marqués pendant le vol (ex: départ, arrivée, etc.).
+📄 Voir [RECORDTYPE_E.md](RECORDTYPE_E.md) pour plus de détails.
 
 ## F - Constellation
 Informations sur la constellation GPS utilisée.
+📄 Voir [RECORDTYPE_F.md](RECORDTYPE_F.md) pour plus de détails.
 
 ## G - Security
 Checksum SHA1 pour validation de l'intégrité du fichier.
+📄 Voir [RECORDTYPE_G.md](RECORDTYPE_G.md) pour plus de détails.
 
 ## H - File header
 En-têtes contenant les métadonnées du vol (pilote, planeur, date, etc.).
