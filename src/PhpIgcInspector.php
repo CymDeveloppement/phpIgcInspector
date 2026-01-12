@@ -135,8 +135,11 @@ class PhpIgcInspector
             $recordId = $record->getRecordId();
             $parsedData = $record->parse();
             
-            // Si le record est unique, stocker directement
-            if ($record->isSingleRecord()) {
+            // Traitement spécial pour RecordTypeC (Task)
+            if ($firstChar === 'C') {
+                $this->processTaskRecord($flight, $parsedData);
+            } elseif ($record->isSingleRecord()) {
+                // Si le record est unique, stocker directement
                 $flight->$recordId = $parsedData;
             } elseif ($record->isSingleObject()) {
                 // Si les enregistrements multiples doivent être fusionnés dans un seul objet
@@ -180,8 +183,511 @@ class PhpIgcInspector
         
         // Stocker l'objet flight dans une propriété
         $this->flight = $flight;
+        
+        // Finaliser la structure de la tâche si elle existe
+        $this->finalizeTask();
+        
+        // Calculer les valeurs dérivées après le parsing complet
+        $this->calculateDerivedValues();
 
         return true;
+    }
+    
+    /**
+     * Valide les turnpoints en vérifiant la proximité des points GPS avec les waypoints de la tâche
+     * 
+     * @param float $proximityRadius Distance en mètres pour valider la proximité d'un turnpoint (défaut: 5000 m)
+     * @return bool True si tous les turnpoints sont validés dans l'ordre
+     */
+    public function validTurnPoint(float $proximityRadius = 5000.0): bool
+    {
+        if ($this->flight === null || !isset($this->flight->Task) || !isset($this->flight->Fix)) {
+            return false;
+        }
+        
+        $task = $this->flight->Task;
+        
+        // Vérifier qu'il y a des waypoints et des points GPS
+        if (!isset($task->waypoints) || empty($task->waypoints) || 
+            !is_array($this->flight->Fix) || empty($this->flight->Fix)) {
+            return false;
+        }
+        
+        // Initialiser les résultats de validation
+        if (!isset($task->turnPointValidation)) {
+            $task->turnPointValidation = (object) [
+                'proximityRadius' => $proximityRadius,
+                'validatedTurnPoints' => [],
+                'missedTurnPoints' => [],
+                'allValidated' => false,
+                'validationOrder' => []
+            ];
+        }
+        
+        $validation = $task->turnPointValidation;
+        $validation->proximityRadius = $proximityRadius;
+        
+        // Créer la liste des waypoints à valider (départ, tours, arrivée)
+        $waypointsToValidate = [];
+        
+        if (isset($task->start)) {
+            $waypointsToValidate[] = ['waypoint' => $task->start, 'type' => 'start', 'index' => 0];
+        }
+        
+        if (isset($task->turnPoints)) {
+            foreach ($task->turnPoints as $index => $turnPoint) {
+                $waypointsToValidate[] = ['waypoint' => $turnPoint, 'type' => 'turn', 'index' => $index + 1];
+            }
+        }
+        
+        if (isset($task->finish)) {
+            $waypointsToValidate[] = ['waypoint' => $task->finish, 'type' => 'finish', 'index' => count($waypointsToValidate)];
+        }
+        
+        // Parcourir les points GPS dans l'ordre chronologique
+        $currentWaypointIndex = 0;
+        $validatedWaypoints = [];
+        $missedWaypoints = [];
+        $validationOrder = [];
+        
+        foreach ($this->flight->Fix as $fixIndex => $fix) {
+            if (!isset($fix->latitude) || !isset($fix->longitude)) {
+                continue;
+            }
+            
+            // Vérifier si on a déjà validé tous les waypoints
+            if ($currentWaypointIndex >= count($waypointsToValidate)) {
+                break;
+            }
+            
+            $targetWaypoint = $waypointsToValidate[$currentWaypointIndex];
+            $waypoint = $targetWaypoint['waypoint'];
+            
+            if (!isset($waypoint->latitude) || !isset($waypoint->longitude)) {
+                continue;
+            }
+            
+            // Calculer la distance entre le point GPS et le waypoint
+            $distance = $this->calculateProximity(
+                $fix->latitude,
+                $fix->longitude,
+                $waypoint->latitude,
+                $waypoint->longitude
+            );
+            
+            // Vérifier si le point est dans le rayon de proximité
+            if ($distance <= $proximityRadius) {
+                // Waypoint validé
+                $validatedWaypoint = (object) [
+                    'waypoint' => $waypoint,
+                    'type' => $targetWaypoint['type'],
+                    'index' => $targetWaypoint['index'],
+                    'validatedAt' => isset($fix->dateTime) ? $fix->dateTime : null,
+                    'validatedAtTimestamp' => isset($fix->timestamp) ? $fix->timestamp : null,
+                    'distance' => round($distance, 2),
+                    'fixIndex' => $fixIndex
+                ];
+                
+                $validatedWaypoints[] = $validatedWaypoint;
+                $validationOrder[] = $validatedWaypoint;
+                
+                // Passer au waypoint suivant
+                $currentWaypointIndex++;
+            }
+        }
+        
+        // Identifier les waypoints manqués
+        for ($i = $currentWaypointIndex; $i < count($waypointsToValidate); $i++) {
+            $missedWaypoint = (object) [
+                'waypoint' => $waypointsToValidate[$i]['waypoint'],
+                'type' => $waypointsToValidate[$i]['type'],
+                'index' => $waypointsToValidate[$i]['index']
+            ];
+            $missedWaypoints[] = $missedWaypoint;
+        }
+        
+        // Mettre à jour les résultats
+        $validation->validatedTurnPoints = $validatedWaypoints;
+        $validation->missedTurnPoints = $missedWaypoints;
+        $validation->validationOrder = $validationOrder;
+        $validation->allValidated = empty($missedWaypoints);
+        $validation->validatedCount = count($validatedWaypoints);
+        $validation->totalWaypoints = count($waypointsToValidate);
+        
+        return $validation->allValidated;
+    }
+    
+    /**
+     * Calcule la distance entre deux points GPS (proximité)
+     * 
+     * @param float $latitude1 Latitude du premier point (degrés décimaux)
+     * @param float $longitude1 Longitude du premier point (degrés décimaux)
+     * @param float $latitude2 Latitude du deuxième point (degrés décimaux)
+     * @param float $longitude2 Longitude du deuxième point (degrés décimaux)
+     * @return float Distance en mètres
+     */
+    public function calculateProximity(float $latitude1, float $longitude1, float $latitude2, float $longitude2): float
+    {
+        // Points identiques
+        if ($latitude1 == $latitude2 && $longitude1 == $longitude2) {
+            return 0.0;
+        }
+        
+        // Rayon de la Terre en mètres (WGS84)
+        $earthRadius = 6378137.0;
+        
+        // Conversion en radians
+        $lat1 = deg2rad($latitude1);
+        $lon1 = deg2rad($longitude1);
+        $lat2 = deg2rad($latitude2);
+        $lon2 = deg2rad($longitude2);
+        
+        // Différences
+        $dLat = $lat2 - $lat1;
+        $dLon = $lon2 - $lon1;
+        
+        // Formule de Haversine
+        $a = sin($dLat / 2) * sin($dLat / 2) +
+             cos($lat1) * cos($lat2) *
+             sin($dLon / 2) * sin($dLon / 2);
+        
+        $c = 2 * atan2(sqrt($a), sqrt(1 - $a));
+        $distance = $earthRadius * $c;
+        
+        // Protection contre NaN et valeurs infinies
+        if (is_nan($distance) || is_infinite($distance)) {
+            return PHP_FLOAT_MAX;
+        }
+        
+        return $distance;
+    }
+    
+    /**
+     * Traite un enregistrement de type C (Task)
+     * 
+     * @param object $flight Objet flight
+     * @param object|null $parsedData Données parsées
+     */
+    private function processTaskRecord(object $flight, ?object $parsedData): void
+    {
+        if ($parsedData === null) {
+            return;
+        }
+        
+        // Initialiser l'objet Task s'il n'existe pas
+        if (!isset($flight->Task)) {
+            $flight->Task = (object) [
+                'declaration' => null,
+                'waypoints' => []
+            ];
+        }
+        
+        // Vérifier si c'est une déclaration (contient declarationDate)
+        if (isset($parsedData->declarationDate)) {
+            $flight->Task->declaration = $parsedData;
+        } else {
+            // C'est un waypoint
+            // Ignorer les waypoints avec des coordonnées 0,0 (C0000000N00000000E)
+            if (isset($parsedData->isStartFinish) && $parsedData->isStartFinish) {
+                // Ignorer ce waypoint (coordonnées 0,0)
+                return;
+            }
+            
+            // Vérifier aussi explicitement les coordonnées nulles
+            if (isset($parsedData->latitude) && isset($parsedData->longitude)) {
+                if ($parsedData->latitude == 0 && $parsedData->longitude == 0) {
+                    // Ignorer ce waypoint
+                    return;
+                }
+            }
+            
+            // Ajouter le waypoint valide
+            $flight->Task->waypoints[] = $parsedData;
+        }
+    }
+    
+    /**
+     * Finalise la structure de la tâche après le parsing complet
+     */
+    private function finalizeTask(): void
+    {
+        if ($this->flight === null || !isset($this->flight->Task)) {
+            return;
+        }
+        
+        $task = $this->flight->Task;
+        
+        // Identifier le départ et l'arrivée
+        if (isset($task->waypoints) && count($task->waypoints) > 0) {
+            // Le premier waypoint non-startFinish est généralement le départ
+            // Le dernier waypoint non-startFinish est généralement l'arrivée
+            $startFinishPoints = [];
+            $turnPoints = [];
+            
+            foreach ($task->waypoints as $waypoint) {
+                if (isset($waypoint->isStartFinish) && $waypoint->isStartFinish) {
+                    $startFinishPoints[] = $waypoint;
+                } else {
+                    $turnPoints[] = $waypoint;
+                }
+            }
+            
+            // Départ : premier waypoint non-startFinish ou premier startFinish
+            if (!empty($turnPoints)) {
+                $task->start = $turnPoints[0];
+            } elseif (!empty($startFinishPoints)) {
+                $task->start = $startFinishPoints[0];
+            }
+            
+            // Arrivée : dernier waypoint non-startFinish ou dernier startFinish
+            if (!empty($turnPoints)) {
+                $task->finish = $turnPoints[count($turnPoints) - 1];
+            } elseif (count($startFinishPoints) > 1) {
+                $task->finish = $startFinishPoints[count($startFinishPoints) - 1];
+            } elseif (count($startFinishPoints) === 1) {
+                $task->finish = $startFinishPoints[0];
+            }
+            
+            // Points de tour (tous sauf départ et arrivée)
+            if (count($turnPoints) > 2) {
+                $task->turnPoints = array_slice($turnPoints, 1, -1);
+            } else {
+                $task->turnPoints = [];
+            }
+            
+            // Nombre total de waypoints
+            $task->waypointCount = count($task->waypoints);
+            $task->turnPointCount = count($task->turnPoints);
+            
+            // Calculer la distance totale de la tâche
+            $task->taskDistance = $this->calculateTaskDistance($task);
+            if ($task->taskDistance !== null) {
+                $task->taskDistanceKm = round($task->taskDistance / 1000, 2);
+                $task->taskDistanceFormatted = number_format($task->taskDistanceKm, 2, '.', ' ') . ' km';
+            }
+            
+            // Valider automatiquement les turnpoints si des waypoints existent
+            if ($task->waypointCount > 0 && isset($this->flight->Fix) && count($this->flight->Fix) > 0) {
+                $this->validTurnPoint(5000.0);
+            }
+        }
+    }
+    
+    /**
+     * Calcule la distance totale de la tâche en additionnant les distances entre les waypoints
+     * 
+     * @param object $task Objet Task
+     * @return float|null Distance totale en mètres, ou null si impossible à calculer
+     */
+    private function calculateTaskDistance(object $task): ?float
+    {
+        // Créer la liste des waypoints dans l'ordre (départ → tours → arrivée)
+        $waypointsInOrder = [];
+        
+        if (isset($task->start)) {
+            $waypointsInOrder[] = $task->start;
+        }
+        
+        if (isset($task->turnPoints)) {
+            foreach ($task->turnPoints as $turnPoint) {
+                $waypointsInOrder[] = $turnPoint;
+            }
+        }
+        
+        if (isset($task->finish)) {
+            $waypointsInOrder[] = $task->finish;
+        }
+        
+        // Si moins de 2 waypoints, impossible de calculer une distance
+        if (count($waypointsInOrder) < 2) {
+            return null;
+        }
+        
+        // Calculer la distance totale en additionnant les distances entre waypoints consécutifs
+        $totalDistance = 0.0;
+        
+        for ($i = 0; $i < count($waypointsInOrder) - 1; $i++) {
+            $waypoint1 = $waypointsInOrder[$i];
+            $waypoint2 = $waypointsInOrder[$i + 1];
+            
+            if (!isset($waypoint1->latitude) || !isset($waypoint1->longitude) ||
+                !isset($waypoint2->latitude) || !isset($waypoint2->longitude)) {
+                continue;
+            }
+            
+            $segmentDistance = $this->calculateProximity(
+                $waypoint1->latitude,
+                $waypoint1->longitude,
+                $waypoint2->latitude,
+                $waypoint2->longitude
+            );
+            
+            $totalDistance += $segmentDistance;
+        }
+        
+        return $totalDistance;
+    }
+    
+    /**
+     * Calcule et ajoute des valeurs dérivées après le parsing complet
+     * 
+     * Cette méthode ajoute des conversions et calculs utiles :
+     * - Conversion du temps total en format hh:mm:ss
+     * - Conversion des distances en kilomètres
+     * - Calcul de la vitesse moyenne
+     * - Calcul des altitudes min/max
+     * - etc.
+     */
+    private function calculateDerivedValues(): void
+    {
+        if ($this->flight === null) {
+            return;
+        }
+        
+        // Calculer les valeurs dérivées dans OtherInformation
+        if (isset($this->flight->OtherInformation)) {
+            $info = $this->flight->OtherInformation;
+            
+            // Conversion du temps total en format hh:mm:ss
+            if (isset($info->totalTime) && $info->totalTime > 0) {
+                $info->totalTimeFormatted = $this->secondsToTime($info->totalTime);
+                $info->totalTimeHours = round($info->totalTime / 3600, 2);
+            }
+            
+            // Conversion de la distance totale en kilomètres
+            if (isset($info->totalDistance) && $info->totalDistance > 0) {
+                $info->totalDistanceKm = round($info->totalDistance / 1000, 2);
+                $info->totalDistanceFormatted = number_format($info->totalDistanceKm, 2, '.', ' ') . ' km';
+            }
+            
+            // Calcul de la vitesse moyenne (km/h)
+            if (isset($info->totalTime) && isset($info->totalDistance) && 
+                $info->totalTime > 0 && $info->totalDistance > 0) {
+                $info->averageSpeed = round(($info->totalDistance / $info->totalTime) * 3.6, 2);
+            }
+            
+            // Formatage de la vitesse max
+            if (isset($info->maxSpeed)) {
+                $info->maxSpeedFormatted = number_format($info->maxSpeed, 2, '.', ' ') . ' km/h';
+            }
+        }
+        
+        // Calculer les altitudes min/max depuis les points GPS
+        if (isset($this->flight->Fix) && is_array($this->flight->Fix) && count($this->flight->Fix) > 0) {
+            $altitudesQnh = []; // Altitudes barométriques QNH (absolues)
+            $altitudesQfe = []; // Altitudes barométriques QFE (relatives au décollage)
+            $gnssAltitudes = [];
+            
+            // Récupérer l'altitude QNH du premier point (décollage)
+            $firstFix = $this->flight->Fix[0];
+            $takeoffQnh = $firstFix->pressureAltitude ?? $firstFix->barometricAltitude ?? $firstFix->qnh ?? null;
+            
+            foreach ($this->flight->Fix as $fix) {
+                // Altitude barométrique QNH (absolue) - peut être dans pressureAltitude, barometricAltitude ou qnh
+                $qnhAlt = $fix->pressureAltitude ?? $fix->barometricAltitude ?? $fix->qnh ?? null;
+                if ($qnhAlt !== null) {
+                    $altitudesQnh[] = $qnhAlt;
+                    
+                    // Calculer l'altitude QFE relative au décollage
+                    // QFE = altitude relative au niveau de l'aérodrome (décollage)
+                    if ($takeoffQnh !== null) {
+                        $qfe = $qnhAlt - $takeoffQnh;
+                        $fix->qfe = $qfe; // QFE = altitude relative au décollage
+                        $fix->altitudeRelative = $qfe; // Alias
+                        $altitudesQfe[] = $qfe;
+                    }
+                }
+                if (isset($fix->gnssAltitude) && $fix->gnssAltitude !== null) {
+                    $gnssAltitudes[] = $fix->gnssAltitude;
+                }
+            }
+            
+            if (!empty($altitudesQnh)) {
+                if (!isset($this->flight->OtherInformation)) {
+                    $this->flight->OtherInformation = (object) [];
+                }
+                $this->flight->OtherInformation->minAltitude = min($altitudesQnh);
+                $this->flight->OtherInformation->maxAltitude = max($altitudesQnh);
+                $this->flight->OtherInformation->altitudeRange = 
+                    $this->flight->OtherInformation->maxAltitude - $this->flight->OtherInformation->minAltitude;
+                
+                // Alias pour QNH (absolue)
+                $this->flight->OtherInformation->minQnh = $this->flight->OtherInformation->minAltitude;
+                $this->flight->OtherInformation->maxQnh = $this->flight->OtherInformation->maxAltitude;
+                $this->flight->OtherInformation->qnhRange = $this->flight->OtherInformation->altitudeRange;
+                
+                // Altitude de décollage (QNH)
+                if ($takeoffQnh !== null) {
+                    $this->flight->OtherInformation->takeoffQnh = $takeoffQnh;
+                    $this->flight->OtherInformation->takeoffAltitude = $takeoffQnh;
+                }
+            }
+            
+            // Statistiques sur les altitudes QFE (relatives)
+            if (!empty($altitudesQfe)) {
+                if (!isset($this->flight->OtherInformation)) {
+                    $this->flight->OtherInformation = (object) [];
+                }
+                $this->flight->OtherInformation->minQfe = min($altitudesQfe);
+                $this->flight->OtherInformation->maxQfe = max($altitudesQfe);
+                $this->flight->OtherInformation->qfeRange = 
+                    $this->flight->OtherInformation->maxQfe - $this->flight->OtherInformation->minQfe;
+                
+                // Alias
+                $this->flight->OtherInformation->minAltitudeRelative = $this->flight->OtherInformation->minQfe;
+                $this->flight->OtherInformation->maxAltitudeRelative = $this->flight->OtherInformation->maxQfe;
+                $this->flight->OtherInformation->altitudeRelativeRange = $this->flight->OtherInformation->qfeRange;
+            }
+            
+            if (!empty($gnssAltitudes)) {
+                if (!isset($this->flight->OtherInformation)) {
+                    $this->flight->OtherInformation = (object) [];
+                }
+                $this->flight->OtherInformation->minGnssAltitude = min($gnssAltitudes);
+                $this->flight->OtherInformation->maxGnssAltitude = max($gnssAltitudes);
+                $this->flight->OtherInformation->gnssAltitudeRange = 
+                    $this->flight->OtherInformation->maxGnssAltitude - $this->flight->OtherInformation->minGnssAltitude;
+            }
+        }
+        
+        // Calculer la durée du vol (du premier au dernier point)
+        if (isset($this->flight->Fix) && is_array($this->flight->Fix) && count($this->flight->Fix) > 0) {
+            $firstFix = $this->flight->Fix[0];
+            $lastFix = $this->flight->Fix[count($this->flight->Fix) - 1];
+            
+            if (isset($firstFix->timestamp) && isset($lastFix->timestamp)) {
+                $flightDuration = $lastFix->timestamp - $firstFix->timestamp;
+                
+                if (!isset($this->flight->OtherInformation)) {
+                    $this->flight->OtherInformation = (object) [];
+                }
+                $this->flight->OtherInformation->flightDuration = $flightDuration;
+                $this->flight->OtherInformation->flightDurationFormatted = $this->secondsToTime($flightDuration);
+                
+                // Date/heure de début et fin
+                if (isset($firstFix->dateTime)) {
+                    $this->flight->OtherInformation->flightStart = $firstFix->dateTime;
+                }
+                if (isset($lastFix->dateTime)) {
+                    $this->flight->OtherInformation->flightEnd = $lastFix->dateTime;
+                }
+            }
+        }
+    }
+    
+    /**
+     * Convertit des secondes en format hh:mm:ss
+     * 
+     * @param int $seconds Nombre de secondes
+     * @return string Format hh:mm:ss
+     */
+    private function secondsToTime(int $seconds): string
+    {
+        $hours = floor($seconds / 3600);
+        $minutes = floor(($seconds % 3600) / 60);
+        $secs = $seconds % 60;
+        
+        return sprintf('%02d:%02d:%02d', $hours, $minutes, $secs);
     }
     
     /**
@@ -230,8 +736,6 @@ class PhpIgcInspector
         if ($this->flight === null) {
             return null;
         }
-        /*var_dump(json_encode($this->flight, $flags));
-        var_dump(json_last_error_msg());*/
         return json_encode($this->flight, $flags);
     }
     
@@ -243,6 +747,104 @@ class PhpIgcInspector
     public function toJson(): ?string
     {
         return $this->stringify();
+    }
+    
+    /**
+     * Extrait chaque type d'enregistrement dans un fichier séparé
+     * 
+     * @param string $outputDirectory Répertoire de sortie pour les fichiers extraits
+     * @param string|null $prefix Préfixe pour les noms de fichiers (optionnel)
+     * @return array Tableau associatif avec le type d'enregistrement comme clé et le chemin du fichier comme valeur
+     * @throws \RuntimeException Si le répertoire ne peut pas être créé ou si l'écriture échoue
+     */
+    public function rawExtract(string $outputDirectory, ?string $prefix = null): array
+    {
+        if (empty(trim($this->content))) {
+            throw new InvalidIgcException('Le fichier IGC est vide');
+        }
+        
+        // Créer le répertoire de sortie s'il n'existe pas
+        if (!is_dir($outputDirectory)) {
+            if (!mkdir($outputDirectory, 0755, true)) {
+                throw new \RuntimeException("Impossible de créer le répertoire de sortie : {$outputDirectory}");
+            }
+        }
+        
+        // Préparer le préfixe
+        $filePrefix = $prefix !== null ? $prefix . '_' : '';
+        
+        // Séparer les lignes
+        $lines = explode("\n", $this->content);
+        
+        // Grouper les lignes par type d'enregistrement
+        $recordsByType = [];
+        
+        foreach ($lines as $line) {
+            $line = trim($line);
+            
+            // Ignorer les lignes vides
+            if (empty($line)) {
+                continue;
+            }
+            
+            // Récupérer le type d'enregistrement (première lettre)
+            $recordType = $line[0];
+            
+            // Vérifier que c'est une lettre majuscule valide
+            if (!preg_match('/^[A-Z]$/', $recordType)) {
+                continue;
+            }
+            
+            // Ajouter la ligne au groupe correspondant
+            if (!isset($recordsByType[$recordType])) {
+                $recordsByType[$recordType] = [];
+            }
+            
+            $recordsByType[$recordType][] = $line;
+        }
+        
+        // Écrire chaque type dans un fichier séparé
+        $extractedFiles = [];
+        
+        foreach ($recordsByType as $type => $lines) {
+            $filename = $filePrefix . 'record_' . $type . '.igc';
+            $filepath = rtrim($outputDirectory, '/') . '/' . $filename;
+            
+            $content = implode("\n", $lines) . "\n";
+            
+            if (file_put_contents($filepath, $content) === false) {
+                throw new \RuntimeException("Impossible d'écrire le fichier : {$filepath}");
+            }
+            
+            $extractedFiles[$type] = $filepath;
+        }
+        
+        return $extractedFiles;
+    }
+    
+    /**
+     * Extrait chaque type d'enregistrement depuis un fichier IGC dans des fichiers séparés
+     * 
+     * @param string $igcFilePath Chemin vers le fichier IGC source
+     * @param string $outputDirectory Répertoire de sortie pour les fichiers extraits
+     * @param string|null $prefix Préfixe pour les noms de fichiers (optionnel)
+     * @return array Tableau associatif avec le type d'enregistrement comme clé et le chemin du fichier comme valeur
+     * @throws \RuntimeException Si le fichier source ne peut pas être lu ou si l'extraction échoue
+     */
+    public static function rawExtractFromFile(string $igcFilePath, string $outputDirectory, ?string $prefix = null): array
+    {
+        if (!file_exists($igcFilePath)) {
+            throw new \RuntimeException("Le fichier IGC n'existe pas : {$igcFilePath}");
+        }
+        
+        $content = file_get_contents($igcFilePath);
+        
+        if ($content === false) {
+            throw new \RuntimeException("Impossible de lire le fichier IGC : {$igcFilePath}");
+        }
+        
+        $inspector = new self($content);
+        return $inspector->rawExtract($outputDirectory, $prefix);
     }
 }
 
