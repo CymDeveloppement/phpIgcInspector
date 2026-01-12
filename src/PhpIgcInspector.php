@@ -596,7 +596,7 @@ class PhpIgcInspector
                 continue;
             }
             
-            $segmentDistance = $this->calculateProximity(
+            $segmentDistance = PhpIgcUtils::calculateProximity(
                 $waypoint1->latitude,
                 $waypoint1->longitude,
                 $waypoint2->latitude,
