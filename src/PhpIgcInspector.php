@@ -165,7 +165,9 @@ class PhpIgcInspector
                 if (!isset($flight->$recordId)) {
                     $flight->$recordId = [];
                 }
-                $flight->$recordId[] = $parsedData;
+                if(!is_null($parsedData)) {
+                    $flight->$recordId[] = $parsedData;
+                }
             }
             
             $previousRecordType = $firstChar;
@@ -228,7 +230,8 @@ class PhpIgcInspector
         if ($this->flight === null) {
             return null;
         }
-        
+        /*var_dump(json_encode($this->flight, $flags));
+        var_dump(json_last_error_msg());*/
         return json_encode($this->flight, $flags);
     }
     

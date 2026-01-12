@@ -20,7 +20,7 @@ use Ycdev\PhpIgcInspector\Exception\InvalidIgcException;
 class RecordTypeB extends AbstractRecordType
 {
     protected string $recordId = 'Fix';
-    protected int $maxValidSpeed = 300;
+    protected int $maxValidSpeed = 400;
 
     protected array $format = [
         ['time', '/^B(\d{6})/', '/^\d{6}$/'],
@@ -41,21 +41,27 @@ class RecordTypeB extends AbstractRecordType
         return strlen($line) > 0 && $line[0] === 'B';
     }
 
-    public function parse(): object
+    public function parse(): object|null
     {
         // Vérifier la validité du record
         $this->check();
         $data = $this->extract();   
+        $data['satellites'] = (int) $data['satellites'];
+
+        
+
         //timestamp et dateTime     
         $data['timestamp'] = strtotime(((!is_null($this->flight) && isset($this->flight->OtherInformation->date)) ? $this->flight->OtherInformation->date : date('Y-m-d')).' '.$data['time']);
         $data['dateTime'] = date('Y-m-d H:i:s', $data['timestamp']);
 
         //latitude et longitude
-        $data['latitude'] = ((float) $data['latitude']) / 100000;
+        var_dump($data['latitude']);
+        $data['latitude'] = $this->degreeToDecimal((int) substr($data['latitude'], 0, 2), (int) substr($data['latitude'], 2, 2), (int) substr($data['latitude'], 4, 3));
+        var_dump($data['latitude']);
         if($data['latitudeNS'] === 'S') {
             $data['latitude'] = -$data['latitude'];
         }
-        $data['longitude'] = ((float) $data['longitude']) / 100000;
+        $data['longitude'] = $this->degreeToDecimal((int) substr($data['longitude'], 0, 3), (int) substr($data['longitude'], 3, 2), (int) substr($data['longitude'], 5, 3));
         if($data['longitudeEW'] === 'W') {
             $data['longitude'] = -$data['longitude'];
         }
@@ -77,6 +83,11 @@ class RecordTypeB extends AbstractRecordType
                 $lastRecord = $this->flight->Fix[count($this->flight->Fix) - 1];
                 $data['distanceFromLastRecord'] = $this->distanceGps($lastRecord->latitude, $lastRecord->longitude, $data['latitude'], $data['longitude']);
                 $data['speed'] = $this->speedGps($data['distanceFromLastRecord'], $data['timestamp'] - $lastRecord->timestamp);
+
+                if(!$this->isCorrectRecord($data)) {
+                    return null;
+                }
+
                 if(!isset($this->flight->OtherInformation->totalDistance)) {
                     $this->flight->OtherInformation->totalDistance = 0;
                 }
@@ -91,17 +102,18 @@ class RecordTypeB extends AbstractRecordType
                 }
                 $this->flight->OtherInformation->totalTime += $data['timestamp'] - $lastRecord->timestamp;
                 $this->flight->OtherInformation->totalDistance += $data['distanceFromLastRecord'];
-                if($data['speed'] > 200) {
-                    var_dump([$data,$lastRecord]);
-                    exit;
-                }
+                
                 $this->flight->OtherInformation->maxSpeed = max($this->flight->OtherInformation->maxSpeed, $data['speed']);
             } else {
                 $data['distanceFromLastRecord'] = 0;
                 $data['speed'] = 0;
             }
         }
-        
+
+        if(!$this->isCorrectRecord($data)) {
+            return null;
+        }
+
         return (object) $data;
     }
 
@@ -113,6 +125,9 @@ class RecordTypeB extends AbstractRecordType
 
     private function distanceGps($latitude1, $longitude1, $latitude2, $longitude2)
     {
+        if($latitude1 == $latitude2 && $longitude1 == $longitude2) {
+            return 0;
+        }
         //distance en mètres
         $lat1 = deg2rad($latitude1);
         $lon1 = deg2rad($longitude1);
@@ -127,10 +142,34 @@ class RecordTypeB extends AbstractRecordType
         // vitesse en km/h
         // distance en mètres, temps en secondes
         // Conversion : m/s * 3.6 = km/h
-        if ($time == 0) {
+        if ($time == 0 || $distance == 0) {
             return 0;
         }
         $speed = ($distance / $time) * 3.6;
         return round($speed, 2);
+    }
+
+    private function isCorrectRecord(array $data): bool
+    {
+        if(is_nan($data['speed'])) {
+            $this->recordError('Speed is NaN');
+            return false;
+        }
+
+        if(is_infinite($data['speed'])) {
+            $this->recordError('Speed is infinite');
+            return false;
+        }
+
+        if(!is_null($this->flight) && isset($data['speed']) && $data['speed'] > $this->maxValidSpeed) {
+            $this->recordError('Speed too high: '.$data['speed'].' km/h');
+            return false;
+        }
+        return true;
+    }
+
+    private function degreeToDecimal($degree, $minutes, $seconds)
+    {
+        return $degree + $minutes / 60 + $seconds / 3600;
     }
 }

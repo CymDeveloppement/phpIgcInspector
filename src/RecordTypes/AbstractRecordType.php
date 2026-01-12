@@ -328,5 +328,20 @@ abstract class AbstractRecordType implements RecordTypeInterface
         
         return true;
     }
+
+    public function recordError($errorMessage)
+    {
+        if(!is_null($this->flight)) {
+            if(!isset($this->flight->OtherInformation->errors)) {
+                $this->flight->OtherInformation->errors = [];
+            }
+            if(!isset($this->flight->OtherInformation->errorCount)) {
+                $this->flight->OtherInformation->errorCount = 0;
+            }
+            $this->flight->OtherInformation->errors[] = $errorMessage.' (Line '.$this->lineNumber.')';
+            $this->flight->OtherInformation->errorCount++;
+            return true;
+        }
+    }
 }
 
