@@ -1,2 +1,12 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Exclure les fichiers de développement du package distribué
+/dev/ export-ignore
+/doc/ export-ignore
+/tests/ export-ignore
+phpunit.xml export-ignore
+.gitattributes export-ignore
+.gitignore export-ignore
+.editorconfig export-ignore
+.phpunit.result.cache export-ignore
